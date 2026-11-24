@@ -1,0 +1,358 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-gateway
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app: model-gateway
+    environment: ${APP_ENVIRONMENT}
+  annotations:
+    eks.amazonaws.com/role-arn: ${MODEL_GATEWAY_IRSA_ROLE_ARN}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-gateway-config
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app: model-gateway
+    environment: ${APP_ENVIRONMENT}
+data:
+  config.yaml: |
+    # Bedrock's Converse API rejects some OpenAI parameters (for example
+    # tool_choice="none", which Open WebUI sends when it wants a final answer
+    # after tool calls). Drop them instead of failing the whole reply.
+    litellm_settings:
+      drop_params: true
+    model_list:
+      - model_name: bedrock-claude-sonnet-5-5
+        litellm_params:
+          model: bedrock/converse/global.anthropic.claude-sonnet-5-5
+          aws_region_name: us-east-1
+      - model_name: bedrock-kimi-k3
+        litellm_params:
+          model: bedrock/converse/global.moonshotai.kimi-k3
+          aws_region_name: us-east-1
+      - model_name: bedrock-kimi-k2-5
+        litellm_params:
+          model: bedrock/converse/moonshotai.kimi-k2.5
+          aws_region_name: us-east-1
+      - model_name: bedrock-glm-5
+        litellm_params:
+          model: bedrock/converse/zai.glm-5
+          aws_region_name: us-east-1
+      - model_name: bedrock-gemma-3-27b
+        litellm_params:
+          model: bedrock/converse/google.gemma-3-27b-it
+          aws_region_name: us-east-1
+      - model_name: bedrock-nova-pro
+        litellm_params:
+          model: bedrock/converse/us.amazon.nova-pro-v1:0
+          aws_region_name: us-east-1
+      - model_name: bedrock-nova-lite
+        litellm_params:
+          model: bedrock/converse/us.amazon.nova-lite-v1:0
+          aws_region_name: us-east-1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-gateway
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app: model-gateway
+    environment: ${APP_ENVIRONMENT}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: model-gateway
+  template:
+    metadata:
+      labels:
+        app: model-gateway
+        environment: ${APP_ENVIRONMENT}
+    spec:
+      serviceAccountName: model-gateway
+      enableServiceLinks: false
+      containers:
+        - name: litellm
+          image: ghcr.io/berriai/litellm:main-latest
+          args:
+            - "--config"
+            - "/app/config.yaml"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "4000"
+          ports:
+            - containerPort: 4000
+          env:
+            - name: AWS_REGION_NAME
+              value: "us-east-1"
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: LITELLM_MASTER_KEY
+          volumeMounts:
+            - name: model-gateway-config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 4000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 4000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: model-gateway-config
+          configMap:
+            name: model-gateway-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-gateway
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app: model-gateway
+    environment: ${APP_ENVIRONMENT}
+spec:
+  selector:
+    app: model-gateway
+  ports:
+    - name: http
+      port: 4000
+      targetPort: 4000
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app: open-webui
+    environment: ${APP_ENVIRONMENT}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: open-webui
+  template:
+    metadata:
+      labels:
+        app: open-webui
+        environment: ${APP_ENVIRONMENT}
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: open-webui
+          image: ${ECR_OPEN_WEBUI}:${IMAGE_TAG}
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ENV
+              value: "prod"
+            - name: PORT
+              value: "8080"
+            - name: WEBUI_NAME
+              value: "Chewie"
+            - name: WEBUI_URL
+              value: "${WEBUI_URL}"
+            - name: CORS_ALLOW_ORIGIN
+              value: "${WEBUI_URL}"
+            - name: ARTHA_CONNECTOR_MCP_URL
+              value: "${ARTHA_CONNECTOR_MCP_URL}"
+            - name: PERSONAL_MCP_CHEWIE_CONTEXT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: PERSONAL_MCP_CHEWIE_CONTEXT_KEY
+            - name: ENABLE_OLLAMA_API
+              value: "true"
+            - name: ENABLE_OPENAI_API
+              value: "true"
+            - name: OPENAI_API_BASE_URLS
+              value: "http://model-gateway.${K8S_NAMESPACE}.svc.cluster.local:4000/v1"
+            - name: OPENAI_API_CONFIGS
+              value: '{"0":{"enable":true,"provider":"litellm","prefix_id":"bedrock"}}'
+            - name: OPENAI_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: LITELLM_MASTER_KEY
+            - name: K8S_FLAG
+              value: "true"
+            - name: OLLAMA_BASE_URL
+              value: "http://ollama.artha-models.svc.cluster.local:11434"
+            - name: OLLAMA_BASE_URLS
+              value: "http://ollama.artha-models.svc.cluster.local:11434"
+            - name: RAG_OLLAMA_BASE_URL
+              value: "http://ollama.artha-models.svc.cluster.local:11434"
+            - name: RAG_EMBEDDING_ENGINE
+              value: "ollama"
+            - name: RAG_EMBEDDING_MODEL
+              value: "nomic-embed-text"
+            - name: RAG_EMBEDDING_BATCH_SIZE
+              value: "10"
+            - name: RAG_TEMPLATE
+              value: |
+                ### Task:
+                Answer the user's query using only the provided source context.
+
+                ### Grounding Rules:
+                - Treat the source context as the authority for factual claims.
+                - If the answer is not present in the source context, say that the retrieved sources do not contain enough information.
+                - Do not use unrelated chat history, previous conversations, notes, automations, or general background knowledge to fill gaps.
+                - When filenames or dates are requested, use the filename and source-date attributes from the <source> tags when available.
+                - Include concise inline citations in [id] format for source-backed claims.
+                - Do not include XML tags in the response.
+
+                ### User Query:
+                {{QUERY}}
+
+                <context>
+                {{CONTEXT}}
+                </context>
+
+                ### Output:
+                Provide a direct, source-grounded answer. For source-heavy requests, prefer a compact table.
+            - name: DEFAULT_MODEL_PARAMS
+              value: '{}'
+            - name: AIOHTTP_CLIENT_TIMEOUT
+              value: "600"
+            - name: OPEN_WEBUI_CONFIG_OVERRIDE_KEYS
+              value: "webui.url,ui.enable_login_form,ui.enable_signup,ui.default_user_role,oauth.auto_redirect,oauth.enable_role_mapping,oauth.roles_claim,oauth.allowed_roles,oauth.admin_roles,ollama.enable,ollama.base_urls,openai.enable,openai.api_base_urls,openai.api_keys,openai.api_configs,rag.ollama.base_url,rag.embedding_engine,rag.embedding_model,rag.embedding_batch_size,rag.template,models.default_params"
+            - name: DISABLED_BUILTIN_TOOL_CATEGORIES
+              value: "tasks,automations,calendar,notes"
+            - name: STRICT_KNOWLEDGE_TOOL_GROUNDING
+              value: "true"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: DATABASE_URL
+            - name: DATABASE_SCHEMA
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: DATABASE_SCHEMA
+            - name: ENABLE_LOGIN_FORM
+              value: "false"
+            - name: ENABLE_SIGNUP
+              value: "false"
+            - name: DEFAULT_USER_ROLE
+              value: "user"
+            - name: ENABLE_OAUTH
+              value: "true"
+            - name: ENABLE_OAUTH_SIGNUP
+              value: "true"
+            - name: OAUTH_MERGE_ACCOUNTS_BY_EMAIL
+              value: "true"
+            - name: OAUTH_AUTO_REDIRECT
+              value: "true"
+            - name: ENABLE_OAUTH_ROLE_MANAGEMENT
+              value: "true"
+            - name: OAUTH_ROLES_CLAIM
+              value: "chewie_role"
+            - name: OAUTH_ALLOWED_ROLES
+              value: "chewie-user"
+            - name: OAUTH_ADMIN_ROLES
+              value: "chewie-admin"
+            - name: OAUTH_PROVIDER_NAME
+              value: "Artha"
+            - name: OPENID_PROVIDER_URL
+              value: "${OPENID_PROVIDER_URL}"
+            - name: OPENID_REDIRECT_URI
+              value: "${WEBUI_URL}/oauth/oidc/callback"
+            - name: OAUTH_SCOPES
+              value: "openid email profile"
+            - name: OAUTH_CLIENT_ID
+              value: "${OAUTH_CLIENT_ID}"
+            - name: WEBUI_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: WEBUI_SECRET_KEY
+            - name: OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-secrets
+                  key: OAUTH_CLIENT_SECRET
+          volumeMounts:
+            - name: open-webui-data
+              mountPath: /app/backend/data
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "3Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: open-webui-data
+          persistentVolumeClaim:
+            claimName: open-webui-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app: open-webui
+    environment: ${APP_ENVIRONMENT}
+spec:
+  selector:
+    app: open-webui
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: open-webui-pvc
+  namespace: ${K8S_NAMESPACE}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp2
+  resources:
+    requests:
+      storage: 20Gi

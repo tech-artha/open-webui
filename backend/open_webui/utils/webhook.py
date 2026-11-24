@@ -1,14 +1,12 @@
 import asyncio
-import json
 import logging
 
-from open_webui.config import WEBUI_FAVICON_URL
 from open_webui.env import (
     AIOHTTP_CLIENT_ALLOW_REDIRECTS,
     AIOHTTP_CLIENT_SESSION_SSL,
     VERSION,
 )
-from open_webui.retrieval.web.utils import get_ssrf_safe_session, validate_url
+from open_webui.utils.json_codec import JSONCodec
 
 log = logging.getLogger(__name__)
 
@@ -28,8 +26,10 @@ def _event_text(message: str, description: str | None = None, event_data: dict |
 
 
 async def post_webhook(name: str, url: str, message: str, event_data: dict, description: str | None = None) -> bool:
+    from open_webui.retrieval.web.utils import get_ssrf_safe_session, validate_url
+
     try:
-        log.debug(f'post_webhook: {url}, {message}, {event_data}')
+        log.debug('post_webhook: %s, %s, %s', url, message, event_data)
         # Block private-IP / loopback / cloud-metadata targets — the URL is
         # caller-controlled (user notification settings under
         # ENABLE_USER_WEBHOOKS, automation notification triggers).
@@ -49,12 +49,14 @@ async def post_webhook(name: str, url: str, message: str, event_data: dict, desc
             payload['content'] = content if len(content) < 2000 else f'{content[: 2000 - 20]}... (truncated)'
         # Microsoft Teams Webhooks
         elif 'webhook.office.com' in url:
+            from open_webui.config import WEBUI_FAVICON_URL
+
             action = event_data.get('action', 'undefined')
             user_data = event_data.get('user') or event_data.get('actor') or {}
             if isinstance(user_data, dict):
                 user_dict = user_data
             else:
-                user_dict = json.loads(user_data)
+                user_dict = JSONCodec.loads(user_data)
             facts = [{'name': key, 'value': value} for key, value in user_dict.items()]
             if event_data.get('event'):
                 facts.insert(0, {'name': 'event', 'value': event_data.get('event')})
@@ -69,6 +71,9 @@ async def post_webhook(name: str, url: str, message: str, event_data: dict, desc
                     {
                         'activityTitle': message,
                         'activitySubtitle': f'{name} ({VERSION}) - {action}',
+                        # LICENSE covers this Open WebUI webhook logo.
+                        # Do not alter, remove, obscure, or replace it except as LICENSE permits:
+                        # https://docs.openwebui.com/license.
                         'activityImage': WEBUI_FAVICON_URL,
                         'text': description,
                         'facts': facts,
@@ -80,7 +85,7 @@ async def post_webhook(name: str, url: str, message: str, event_data: dict, desc
         else:
             payload = event_data
 
-        log.debug(f'payload: {payload}')
+        log.debug('payload: %s', payload)
         async with get_ssrf_safe_session() as session:
             async with session.post(
                 url,
@@ -90,7 +95,7 @@ async def post_webhook(name: str, url: str, message: str, event_data: dict, desc
             ) as r:
                 r_text = await r.text()
                 r.raise_for_status()
-                log.debug(f'r.text: {r_text}')
+                log.debug('r.text: %s', r_text)
 
         return True
     except Exception as e:
